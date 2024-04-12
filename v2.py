@@ -3,19 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 #hyperparameters
-block_size = 8
-batch_size = 32
-learning_rate = 1e-3
-iters = 10000
-eval_iters = 300
-
+batch_size = 64 # how many independent sequences will we process in parallel?
+block_size = 256 # what is the maximum context length for predictions?
+max_iters = 5000
+eval_interval = 500
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+eval_iters = 200
+n_embd = 384
 n_head = 6
 n_layer = 6
-n_embd = 32
-
-
 dropout = 0.2
 
 #random
@@ -70,47 +67,46 @@ def estimate_loss(model):
 
 #Multihead-attention
 class Head(nn.Module):
-    """one head self-attention"""
+    """ one head of self-attention """
+
     def __init__(self, head_size):
-        super().__init__(self, head_size)
-        self.key = nn.Linear(n_embd, head_size, bias = False)
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
-        self.drop_out = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        # input of size (batch, time-step, channels)
+        # output of size (batch, time-step, head size)
         B,T,C = x.shape
-        
         k = self.key(x)   # (B,T,hs)
         q = self.query(x) # (B,T,hs)
-        v= self.value(x)  # (B,T,hs)
+        v = self.value(x) # (B,T,hs)
         
-        wei = q @ k.transpose(1,2) / (k.shape[2] ** 0.5) # (B,T,T)
-        wei = wei.mask_fill(self.tril[:T, :T] == 0, float('-inf'))   #(B,T,T)
-        wei = F.softmax(wei, dim=-1)
+        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
         
-        wei = self.drop_out(wei)
-        
-        out = wei @ v    #(B, T, hs)
-        
-        return out   
-    
-    
+        out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
+        return out
+
 class MultiHeadAttention(nn.Module):
     """ multiple heads of self-attention in parallel """
+
     def __init__(self, num_heads, head_size):
         super().__init__()
-        self.heads = nn.ModuleList(Head(head_size), dim = -1)
-        self.proj = nn.Linear(num_heads*head_size, n_embd)
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(head_size * num_heads, n_embd)
         self.dropout = nn.Dropout(dropout)
-        
+
     def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)   #(B, T, nh*hs) --> (B,T,e)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.dropout(self.proj(out))
         return out
-    
     
 class FeedForward(nn.Module):
     def __init__(self, n_embd):
@@ -128,10 +124,10 @@ class FeedForward(nn.Module):
 
 class Block(nn.Module):
     """ Transformer block: communication followed by computation """
-    def __init__(self, n_embed, n_head):
+    def __init__(self, n_embd, n_head):
         super().__init__()
         
-        head_size = n_embd / n_head
+        head_size = n_embd // n_head
         self.sa = MultiHeadAttention(n_head, head_size)
         self.ffn = FeedForward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)
@@ -149,7 +145,7 @@ class GPTLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head) for _ in range(n_layer)])
         self.ln_final = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
         
@@ -172,7 +168,7 @@ class GPTLanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))
         x = tok_emb + pos_emb # (B,T,C)
         x = self.blocks(x) # (B,T,C)
-        x = self.ln_f(x) # (B,T,C)
+        x = self.ln_final(x) # (B,T,C)
         
         logits = self.lm_head(x)          # vocab_size
         
@@ -191,7 +187,7 @@ class GPTLanguageModel(nn.Module):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
             
-            logits, loss = self.forward(idx_cond)
+            logits, _ = self.forward(idx_cond)
             logits = logits[:,-1,:]
             prob = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(prob, num_samples=1)
@@ -201,10 +197,14 @@ class GPTLanguageModel(nn.Module):
 
 #training the model
 m = GPTLanguageModel()
+
+m = m.to(device)
+
+print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
+
 optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
 
-for step in range(iters):
-    
+for step in range(max_iters):
     
     if step % 50 == 0:
         losses = estimate_loss(m)
@@ -217,6 +217,8 @@ for step in range(iters):
     loss.backward()
     optimizer.step()
 
+#save model
+torch.save(m.state_dict(), 'checkpoint.pth')
 
 #testing the model
 print(decode(m.generate(idx = torch.zeros((1, 1), dtype=torch.long), max_new_tokens=500)[0].tolist()))
